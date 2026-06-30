@@ -32,6 +32,20 @@ interface PunchResult {
   longitude?: number
 }
 
+interface PendingPunch {
+  id:         string
+  employeeId: string
+  companyId:  string
+  recordDate: string
+  field:      string   // 'entry_time' | 'break_start' | 'break_end' | 'exit_time'
+  time:       string
+  latitude?:  number
+  longitude?: number
+  accuracy?:  number
+  timestamp:  number   // Date.now() para ordenação
+  attempts:   number   // contador de tentativas
+}
+
 // ── Helpers ────────────────────────────────────────────────────
 
 function fmtTime(d: Date) {
@@ -57,12 +71,37 @@ function nowTimeStr() {
 
 /** Returns which field and label to fill next, or null if day is complete. */
 function nextPunch(record: Record<string, unknown> | null): { field: string; label: string } | null {
-  if (!record)                    return { field: 'entry_time',  label: 'Entrada' }
-  if (!record.entry_time)         return { field: 'entry_time',  label: 'Entrada' }
-  if (!record.break_start)        return { field: 'break_start', label: 'Início de Intervalo' }
-  if (!record.break_end)          return { field: 'break_end',   label: 'Fim de Intervalo' }
-  if (!record.exit_time)          return { field: 'exit_time',   label: 'Saída' }
+  if (!record)              return { field: 'entry_time',  label: 'Entrada' }
+  if (!record.entry_time)   return { field: 'entry_time',  label: 'Entrada' }
+  if (!record.break_start)  return { field: 'break_start', label: 'Início de Intervalo' }
+  if (!record.break_end)    return { field: 'break_end',   label: 'Fim de Intervalo' }
+  if (!record.exit_time)    return { field: 'exit_time',   label: 'Saída' }
   return null
+}
+
+// ── Offline queue (localStorage) ────────────────────────────────
+
+const QUEUE_KEY = 'sibos_ponto_pending_queue'
+
+function getQueue(): PendingPunch[] {
+  try {
+    const raw = localStorage.getItem(QUEUE_KEY)
+    return raw ? JSON.parse(raw) : []
+  } catch {
+    return []
+  }
+}
+
+function saveQueue(queue: PendingPunch[]) {
+  try {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(queue))
+  } catch { /* storage full or unavailable */ }
+}
+
+function addToQueue(punch: Omit<PendingPunch, 'id' | 'timestamp' | 'attempts'>) {
+  const queue = getQueue()
+  queue.push({ ...punch, id: crypto.randomUUID(), timestamp: Date.now(), attempts: 0 })
+  saveQueue(queue)
 }
 
 // ── Main component ─────────────────────────────────────────────
@@ -70,39 +109,114 @@ function nextPunch(record: Record<string, unknown> | null): { field: string; lab
 function KioskInner() {
   const searchParams = useSearchParams()
   const { isLoaded, isLoading: modelsLoading, error: modelError, loadModels } = useFaceApi()
-  const supabase = createClient()
 
   const initialCompany = searchParams.get('company') || ''
 
-  const [companyInput, setCompanyInput] = useState('')
-  const [companyId, setCompanyId] = useState(initialCompany)
-  const [kioskState, setKioskState] = useState<KioskState>(
+  const [companyInput, setCompanyInput]   = useState('')
+  const [companyId, setCompanyId]         = useState(initialCompany)
+  const [kioskState, setKioskState]       = useState<KioskState>(
     initialCompany ? 'loading' : 'company-input'
   )
-  const [currentTime, setCurrentTime] = useState(new Date())
-  const [punchResult, setPunchResult] = useState<PunchResult | null>(null)
-  const [employees, setEmployees] = useState<KioskEmployee[]>([])
+  const [currentTime, setCurrentTime]     = useState(new Date())
+  const [punchResult, setPunchResult]     = useState<PunchResult | null>(null)
+  const [employees, setEmployees]         = useState<KioskEmployee[]>([])
   const [isMatcherReady, setIsMatcherReady] = useState(false)
-  const [errorMsg, setErrorMsg] = useState('')
+  const [errorMsg, setErrorMsg]           = useState('')
+  const [pendingCount, setPendingCount]   = useState(0)
 
-  // Refs for values used inside intervals (avoid stale closures)
-  const kioskStateRef    = useRef<KioskState>(initialCompany ? 'loading' : 'company-input')
-  const faceapiRef       = useRef<typeof import('face-api.js') | null>(null)
-  const faceMatcherRef   = useRef<any>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
-  const cooldownRef      = useRef<Map<string, number>>(new Map())
-  const isProcessingRef  = useRef(false)
-  const videoRef         = useRef<HTMLVideoElement>(null)
-  const employeesRef     = useRef<KioskEmployee[]>([])
-  const companyIdRef     = useRef(initialCompany)
+  // Refs for values used inside intervals / callbacks (avoid stale closures)
+  const kioskStateRef   = useRef<KioskState>(initialCompany ? 'loading' : 'company-input')
+  const faceapiRef      = useRef<typeof import('face-api.js') | null>(null)
+  const faceMatcherRef  = useRef<any>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
+  const cooldownRef     = useRef<Map<string, number>>(new Map())
+  const isProcessingRef = useRef(false)
+  const videoRef        = useRef<HTMLVideoElement>(null)
+  const employeesRef    = useRef<KioskEmployee[]>([])
+  const companyIdRef    = useRef(initialCompany)
+  const supabaseRef     = useRef(createClient())  // stable singleton
 
   const setState = useCallback((s: KioskState) => {
     kioskStateRef.current = s
     setKioskState(s)
   }, [])
 
-  // Sync refs
+  // Sync mutable refs with latest state values
   useEffect(() => { employeesRef.current = employees }, [employees])
   useEffect(() => { companyIdRef.current = companyId }, [companyId])
+
+  // ── Offline sync ───────────────────────────────────────────
+
+  const syncQueue = useCallback(async () => {
+    const queue = getQueue()
+    if (queue.length === 0) { setPendingCount(0); return }
+
+    const supabase = supabaseRef.current
+    const remaining: PendingPunch[] = []
+
+    for (const punch of queue) {
+      try {
+        // Find if a record already exists for this employee/date
+        const { data: existing } = await supabase
+          .from('time_records')
+          .select('id')
+          .eq('employee_id', punch.employeeId)
+          .eq('company_id', punch.companyId)
+          .eq('record_date', punch.recordDate)
+          .maybeSingle()
+
+        const writeData: Record<string, unknown> = {
+          [punch.field]: punch.time,
+          punch_method: 'facial',
+          ...(punch.latitude !== undefined && {
+            latitude:  punch.latitude,
+            longitude: punch.longitude,
+            accuracy:  punch.accuracy,
+          }),
+        }
+
+        if (existing) {
+          await supabase
+            .from('time_records')
+            .update(writeData)
+            .eq('id', (existing as any).id) // eslint-disable-line @typescript-eslint/no-explicit-any
+        } else {
+          await supabase.from('time_records').insert({
+            company_id:  punch.companyId,
+            employee_id: punch.employeeId,
+            record_date: punch.recordDate,
+            status:      'present',
+            ...writeData,
+          })
+        }
+
+        console.log('[SYNC] Punch synced:', punch.id)
+
+      } catch (err) {
+        // Network / Supabase error — keep in queue and retry later
+        punch.attempts += 1
+        if (punch.attempts < 10) {
+          remaining.push(punch)
+        } else {
+          console.error('[SYNC] Punch discarded after 10 attempts:', punch, err)
+        }
+      }
+    }
+
+    saveQueue(remaining)
+    setPendingCount(remaining.length)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Sync: on mount, every 15 s, and when connection is restored ─
+
+  useEffect(() => {
+    syncQueue()
+    const interval = setInterval(syncQueue, 15_000)
+    window.addEventListener('online', syncQueue)
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('online', syncQueue)
+    }
+  }, [syncQueue])
 
   // ── Clock ──────────────────────────────────────────────────
   useEffect(() => {
@@ -133,14 +247,13 @@ function KioskInner() {
     fetchEmployees()
   }, [isLoaded, companyId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Build FaceMatcher — unified guard for isLoaded + employees ───────────
-  // Fixes race condition: if employees arrive before faceapiRef.current is
-  // populated, this effect re-fires when isLoaded transitions to true,
-  // ensuring buildFaceMatcher() is always attempted after both are ready.
+  // ── Build FaceMatcher — unified guard for isLoaded + employees ─
+  // Fixes race condition: if employees arrive before faceapiRef is
+  // populated, this effect re-fires when isLoaded transitions to true.
   useEffect(() => {
     if (!isLoaded) return
     if (employees.length === 0) return
-    if (isMatcherReady) return  // already built, avoid rebuild
+    if (isMatcherReady) return
     buildFaceMatcher()
   }, [isLoaded, employees.length, isMatcherReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -151,7 +264,7 @@ function KioskInner() {
     return () => clearInterval(interval)
   }, [isMatcherReady, isLoaded]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Helpers ────────────────────────────────────────────────
+  // ── Core functions ─────────────────────────────────────────
 
   const startWebcam = async () => {
     try {
@@ -177,7 +290,7 @@ function KioskInner() {
   }
 
   const fetchEmployees = async () => {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseRef.current
       .from('employees')
       .select('id, name, face_descriptor, photo_url')
       .eq('company_id', companyIdRef.current)
@@ -253,25 +366,30 @@ function KioskInner() {
 
     setState('processing')
 
+    // Geolocation (best-effort, non-blocking)
+    let latitude: number | undefined
+    let longitude: number | undefined
+    let accuracy: number | undefined
     try {
-      // Geolocation (best-effort)
-      let latitude: number | undefined
-      let longitude: number | undefined
-      let accuracy: number | undefined
-      try {
-        const pos = await new Promise<GeolocationPosition>((res, rej) =>
-          navigator.geolocation.getCurrentPosition(res, rej, { timeout: 5000 })
-        )
-        latitude  = pos.coords.latitude
-        longitude = pos.coords.longitude
-        accuracy  = pos.coords.accuracy
-      } catch { /* proceed without location */ }
+      const pos = await new Promise<GeolocationPosition>((res, rej) =>
+        navigator.geolocation.getCurrentPosition(res, rej, { timeout: 5000 })
+      )
+      latitude  = pos.coords.latitude
+      longitude = pos.coords.longitude
+      accuracy  = pos.coords.accuracy
+    } catch { /* proceed without location */ }
 
-      const today = todayStr()
-      const now   = nowTimeStr()
+    const today = todayStr()
+    const now   = nowTimeStr()
 
-      // Check today's record
-      const { data: existingRecord } = await supabase
+    // Determine punch type — query Supabase; fall back to entry_time if unreachable.
+    // syncQueue will reconcile field ordering when connectivity is restored.
+    let punchField = 'entry_time'
+    let punchLabel = 'Entrada'
+    let dayAlreadyClosed = false
+
+    try {
+      const { data: existingRecord } = await supabaseRef.current
         .from('time_records')
         .select('id, entry_time, break_start, break_end, exit_time')
         .eq('company_id', companyIdRef.current)
@@ -280,42 +398,35 @@ function KioskInner() {
         .maybeSingle()
 
       const punch = nextPunch(existingRecord as Record<string, unknown> | null)
-
       if (!punch) {
-        // Day already closed
-        setPunchResult({ employeeName: employee.name, punchType: 'Ponto do dia encerrado', time: now })
-        setState('already-done')
-        setTimeout(() => { setPunchResult(null); setState('idle') }, 3000)
-        return
-      }
-
-      const geoFields = latitude !== undefined ? { latitude, longitude, accuracy } : {}
-
-      if (!existingRecord) {
-        await supabase.from('time_records').insert({
-          company_id:  companyIdRef.current,
-          employee_id: employeeId,
-          record_date: today,
-          entry_time:  now,
-          punch_method: 'facial',
-          status: 'present',
-          ...geoFields,
-        })
+        dayAlreadyClosed = true
       } else {
-        await supabase
-          .from('time_records')
-          .update({ [punch.field]: now, punch_method: 'facial', ...geoFields })
-          .eq('id', (existingRecord as any).id) // eslint-disable-line @typescript-eslint/no-explicit-any
+        punchField = punch.field
+        punchLabel = punch.label
       }
-
-      cooldownRef.current.set(employeeId, Date.now())
-      setPunchResult({ employeeName: employee.name, punchType: punch.label, time: now, latitude, longitude })
-      setState('success')
-      setTimeout(() => { setPunchResult(null); setState('idle') }, 4000)
-    } catch (err) {
-      console.error('Punch error:', err)
-      setState('idle')
+    } catch {
+      // Supabase unreachable — default to entry_time
+      console.log('[QUEUE] Supabase unavailable — defaulting field to entry_time')
     }
+
+    if (dayAlreadyClosed) {
+      setPunchResult({ employeeName: employee.name, punchType: 'Ponto do dia encerrado', time: now })
+      setState('already-done')
+      setTimeout(() => { setPunchResult(null); setState('idle') }, 3000)
+      return
+    }
+
+    // Save locally BEFORE any network attempt (optimistic)
+    addToQueue({ employeeId, companyId: companyIdRef.current, recordDate: today, field: punchField, time: now, latitude, longitude, accuracy })
+
+    // Show success immediately — employee never waits for network
+    cooldownRef.current.set(employeeId, Date.now())
+    setPunchResult({ employeeName: employee.name, punchType: punchLabel, time: now, latitude, longitude })
+    setState('success')
+    setTimeout(() => { setPunchResult(null); setState('idle') }, 4000)
+
+    // Sync in background — fire and forget, does not block UI
+    syncQueue()
   }
 
   const handleCompanySubmit = (e: React.FormEvent) => {
@@ -356,6 +467,15 @@ function KioskInner() {
   // ── Render: kiosk ──────────────────────────────────────────
   return (
     <div className="min-h-screen flex flex-col items-center justify-center bg-[#0d1b3e] text-white overflow-hidden">
+
+      {/* Pending sync badge */}
+      {pendingCount > 0 && (
+        <div className="fixed top-2 right-2 bg-amber-500/90 text-white text-xs px-3 py-1 rounded-full flex items-center gap-1 z-50">
+          <span className="animate-pulse">●</span>
+          {pendingCount} ponto(s) sincronizando...
+        </div>
+      )}
+
       {/* Title */}
       <h1 className="text-xl font-bold tracking-widest text-blue-200 mb-4 uppercase">
         SIBOS Ponto Eletrônico
