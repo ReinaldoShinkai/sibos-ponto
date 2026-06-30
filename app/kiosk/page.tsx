@@ -133,11 +133,16 @@ function KioskInner() {
     fetchEmployees()
   }, [isLoaded, companyId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Build FaceMatcher once employees arrive ────────────────
+  // ── Build FaceMatcher — unified guard for isLoaded + employees ───────────
+  // Fixes race condition: if employees arrive before faceapiRef.current is
+  // populated, this effect re-fires when isLoaded transitions to true,
+  // ensuring buildFaceMatcher() is always attempted after both are ready.
   useEffect(() => {
-    if (!isLoaded || employees.length === 0 || !faceapiRef.current) return
+    if (!isLoaded) return
+    if (employees.length === 0) return
+    if (isMatcherReady) return  // already built, avoid rebuild
     buildFaceMatcher()
-  }, [isLoaded, employees]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isLoaded, employees.length, isMatcherReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Recognition loop ───────────────────────────────────────
   useEffect(() => {
@@ -186,13 +191,29 @@ function KioskInner() {
   }
 
   const buildFaceMatcher = async () => {
-    const faceapi = faceapiRef.current!
+    // Self-heal: if faceapiRef wasn't populated yet (race condition), import now.
+    // Module cache guarantees this is instant after loadModels() has resolved.
+    if (!faceapiRef.current) {
+      faceapiRef.current = await import('face-api.js')
+    }
+    const faceapi = faceapiRef.current
+
+    console.log('[DEBUG] Building matcher with', employeesRef.current.length, 'employees')
+    console.log('[DEBUG] faceapi loaded?', !!faceapi)
+
+    if (!faceapi || employeesRef.current.length === 0) {
+      console.log('[DEBUG] Matcher build SKIPPED — missing deps')
+      return
+    }
+
     const labeled = employeesRef.current.map(emp =>
       new faceapi.LabeledFaceDescriptors(emp.id, [new Float32Array(emp.face_descriptor)])
     )
-    faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.5)
+    faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.6)
     setIsMatcherReady(true)
     setState('idle')
+
+    console.log('[DEBUG] Matcher built successfully with', labeled.length, 'labeled descriptors')
   }
 
   const runDetection = async () => {
@@ -210,6 +231,7 @@ function KioskInner() {
 
       if (detection) {
         const match = faceMatcherRef.current.findBestMatch(detection.descriptor)
+        console.log('[DEBUG] Match result:', match.label, 'distance:', match.distance)
         if (match.label !== 'unknown') {
           await handleRecognition(match.label)
         }
