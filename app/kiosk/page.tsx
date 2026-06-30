@@ -19,9 +19,8 @@ type KioskState =
   | 'company-input'
   | 'loading'
   | 'idle'
-  | 'processing'
+  | 'confirming'   // Etapa 1: novo estado intermediário
   | 'success'
-  | 'already-done'
   | 'no-employees'
   | 'error'
 
@@ -37,6 +36,14 @@ interface LastPunch {
   label: string
   time: string
   date: string
+}
+
+// Etapa 1: registro do dia para controle dos botões
+interface TodayRecord {
+  entry_time:  string | null
+  break_start: string | null
+  break_end:   string | null
+  exit_time:   string | null
 }
 
 interface PendingPunch {
@@ -74,15 +81,6 @@ function todayStr() {
 
 function nowTimeStr() {
   return new Date().toTimeString().split(' ')[0]
-}
-
-function nextPunch(record: Record<string, unknown> | null): { field: string; label: string } | null {
-  if (!record)              return { field: 'entry_time',  label: 'Entrada' }
-  if (!record.entry_time)   return { field: 'entry_time',  label: 'Entrada' }
-  if (!record.break_start)  return { field: 'break_start', label: 'Início de Intervalo' }
-  if (!record.break_end)    return { field: 'break_end',   label: 'Fim de Intervalo' }
-  if (!record.exit_time)    return { field: 'exit_time',   label: 'Saída' }
-  return null
 }
 
 function formatarDataRelativa(dateStr: string): string {
@@ -150,6 +148,15 @@ function EmployeeAvatar({ name, photoUrl }: { name: string; photoUrl?: string | 
   )
 }
 
+// ── Labels de cada campo ───────────────────────────────────────
+
+const PUNCH_LABELS: Record<string, string> = {
+  entry_time:  'Entrada',
+  break_start: 'Início de Intervalo',
+  break_end:   'Retorno do Intervalo',
+  exit_time:   'Saída',
+}
+
 // ── Main component ─────────────────────────────────────────────
 
 function KioskInner() {
@@ -167,6 +174,10 @@ function KioskInner() {
   const [punchResult, setPunchResult]               = useState<PunchResult | null>(null)
   const [recognizedEmployee, setRecognizedEmployee] = useState<KioskEmployee | null>(null)
   const [lastPunch, setLastPunch]                   = useState<LastPunch | null>(null)
+  // Etapa 1: novos estados
+  const [confirmingEmployee, setConfirmingEmployee] = useState<KioskEmployee | null>(null)
+  const [todayRecord, setTodayRecord]               = useState<TodayRecord | null>(null)
+  const [isPaused, setIsPaused]                     = useState(false)
   const [employees, setEmployees]                   = useState<KioskEmployee[]>([])
   const [isMatcherReady, setIsMatcherReady]         = useState(false)
   const [errorMsg, setErrorMsg]                     = useState('')
@@ -181,6 +192,8 @@ function KioskInner() {
   const employeesRef    = useRef<KioskEmployee[]>([])
   const companyIdRef    = useRef(initialCompany)
   const supabaseRef     = useRef(createClient())
+  // Etapa 2: geo capturado no reconhecimento, consumido no confirmPunch
+  const geoDataRef      = useRef<{ latitude: number; longitude: number; accuracy: number } | null>(null)
 
   const setState = useCallback((s: KioskState) => {
     kioskStateRef.current = s
@@ -281,12 +294,13 @@ function KioskInner() {
     buildFaceMatcher()
   }, [isLoaded, employees.length, isMatcherReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Recognition loop ───────────────────────────────────────
+  // ── Recognition loop — pausa enquanto confirming está visível ─
+  // Etapa 1: isPaused adicionado como dependência
   useEffect(() => {
-    if (!isMatcherReady || !isLoaded) return
+    if (!isMatcherReady || !isLoaded || isPaused) return
     const interval = setInterval(runDetection, 2000)
     return () => clearInterval(interval)
-  }, [isMatcherReady, isLoaded]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isMatcherReady, isLoaded, isPaused]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Core functions ─────────────────────────────────────────
 
@@ -327,7 +341,6 @@ function KioskInner() {
     setEmployees(data as KioskEmployee[])
   }
 
-  // Etapa 1 — buscar último ponto de dia anterior
   const getLastPunch = async (employeeId: string): Promise<LastPunch | null> => {
     try {
       const { data } = await supabaseRef.current
@@ -353,7 +366,7 @@ function KioskInner() {
           return { label: f.label, time: previous[f.key] as string, date: previous.record_date as string }
         }
       }
-    } catch { /* best-effort — não bloqueia o fluxo */ }
+    } catch { /* best-effort */ }
     return null
   }
 
@@ -401,6 +414,7 @@ function KioskInner() {
     }
   }
 
+  // Etapa 2: handleRecognition agora vai para 'confirming'
   const handleRecognition = async (employeeId: string) => {
     const lastCooldown = cooldownRef.current.get(employeeId)
     if (lastCooldown && Date.now() - lastCooldown < 30_000) return
@@ -408,75 +422,95 @@ function KioskInner() {
     const employee = employeesRef.current.find(e => e.id === employeeId)
     if (!employee) return
 
-    setState('processing')
+    // Pausa detecção imediatamente — isPaused vai limpar o interval no próximo render
+    setIsPaused(true)
 
-    let latitude: number | undefined
-    let longitude: number | undefined
-    let accuracy: number | undefined
+    // Capturar geolocalização (best-effort) e armazenar no ref para uso em confirmPunch
+    geoDataRef.current = null
     try {
       const pos = await new Promise<GeolocationPosition>((res, rej) =>
         navigator.geolocation.getCurrentPosition(res, rej, { timeout: 5000 })
       )
-      latitude = pos.coords.latitude
-      longitude = pos.coords.longitude
-      accuracy = pos.coords.accuracy
+      geoDataRef.current = {
+        latitude:  pos.coords.latitude,
+        longitude: pos.coords.longitude,
+        accuracy:  pos.coords.accuracy,
+      }
     } catch { /* proceed without location */ }
 
-    const today = todayStr()
-    const now   = nowTimeStr()
-
-    let punchField = 'entry_time'
-    let punchLabel = 'Entrada'
-    let dayAlreadyClosed = false
-
+    // Buscar registro de hoje para saber o status de cada botão
+    let record: TodayRecord | null = null
     try {
-      const { data: existingRecord } = await supabaseRef.current
+      const { data } = await supabaseRef.current
         .from('time_records')
-        .select('id, entry_time, break_start, break_end, exit_time')
-        .eq('company_id', companyIdRef.current)
+        .select('entry_time, break_start, break_end, exit_time')
         .eq('employee_id', employeeId)
-        .eq('record_date', today)
+        .eq('company_id', companyIdRef.current)
+        .eq('record_date', todayStr())
         .maybeSingle()
-
-      const punch = nextPunch(existingRecord as Record<string, unknown> | null)
-      if (!punch) dayAlreadyClosed = true
-      else { punchField = punch.field; punchLabel = punch.label }
+      record = data as TodayRecord | null
     } catch {
-      console.log('[QUEUE] Supabase unavailable — defaulting field to entry_time')
+      record = null // Offline: só ENTRADA ficará habilitada
     }
 
-    if (dayAlreadyClosed) {
-      setRecognizedEmployee(employee)
-      setPunchResult({ punchType: 'Ponto do dia encerrado', time: now })
-      setState('already-done')
-      setTimeout(() => {
-        setPunchResult(null)
-        setRecognizedEmployee(null)
-        setState('idle')
-      }, 3000)
-      return
-    }
-
-    // Buscar último ponto do dia anterior (em paralelo, best-effort)
+    // Buscar último ponto do dia anterior (contexto)
     const last = await getLastPunch(employeeId)
-
-    // Enfileirar localmente antes de qualquer I/O de rede
-    addToQueue({ employeeId, companyId: companyIdRef.current, recordDate: today, field: punchField, time: now, latitude, longitude, accuracy })
-
-    // Sucesso imediato — colaborador nunca espera rede
-    cooldownRef.current.set(employeeId, Date.now())
-    setRecognizedEmployee(employee)
     setLastPunch(last)
-    setPunchResult({ punchType: punchLabel, time: now, latitude, longitude, accuracy })
+
+    setConfirmingEmployee(employee)
+    setTodayRecord(record)
+    setState('confirming')
+  }
+
+  // Etapa 2: colaborador escolhe qual ponto registrar
+  const confirmPunch = (field: 'entry_time' | 'break_start' | 'break_end' | 'exit_time') => {
+    if (!confirmingEmployee) return
+
+    const time = nowTimeStr()
+    const geo  = geoDataRef.current
+
+    addToQueue({
+      employeeId: confirmingEmployee.id,
+      companyId:  companyIdRef.current,
+      recordDate: todayStr(),
+      field,
+      time,
+      latitude:   geo?.latitude,
+      longitude:  geo?.longitude,
+      accuracy:   geo?.accuracy,
+    })
+
+    cooldownRef.current.set(confirmingEmployee.id, Date.now())
+    setRecognizedEmployee(confirmingEmployee)
+    setPunchResult({
+      punchType: PUNCH_LABELS[field],
+      time,
+      latitude:  geo?.latitude,
+      longitude: geo?.longitude,
+      accuracy:  geo?.accuracy,
+    })
     setState('success')
+
+    syncQueue()
+
     setTimeout(() => {
       setPunchResult(null)
       setRecognizedEmployee(null)
       setLastPunch(null)
+      setConfirmingEmployee(null)
+      setTodayRecord(null)
+      setIsPaused(false)
       setState('idle')
     }, 4000)
+  }
 
-    syncQueue()
+  // Etapa 2: colaborador cancela (reconhecimento errado)
+  const cancelConfirmation = () => {
+    setConfirmingEmployee(null)
+    setTodayRecord(null)
+    setLastPunch(null)
+    setIsPaused(false)
+    setState('idle')
   }
 
   const handleCompanySubmit = (e: React.FormEvent) => {
@@ -500,9 +534,7 @@ function KioskInner() {
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-b from-[#0d1b3e] to-[#1a2f5c]">
         <div className="bg-white/10 backdrop-blur rounded-2xl p-8 w-full max-w-sm border border-white/10">
           <div className="flex items-center justify-center gap-2 mb-6">
-            <div className="w-8 h-8 rounded bg-[#2e5fab] flex items-center justify-center text-white font-bold text-sm">
-              S
-            </div>
+            <div className="w-8 h-8 rounded bg-[#2e5fab] flex items-center justify-center text-white font-bold text-sm">S</div>
             <h1 className="text-xl font-bold text-white tracking-wide">SIBOS PONTO ELETRÔNICO</h1>
           </div>
           <form onSubmit={handleCompanySubmit} className="flex flex-col gap-4">
@@ -526,17 +558,107 @@ function KioskInner() {
     )
   }
 
+  // ── Render: confirming screen (Etapa 3) ────────────────────
+  if (kioskState === 'confirming' && confirmingEmployee) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-[#0d1b3e] to-[#1a2f5c] flex flex-col items-center justify-center p-6">
+        {PendingBadge}
+
+        <div className="w-full max-w-sm">
+
+          {/* Colaborador identificado */}
+          <div className="bg-white/5 backdrop-blur rounded-2xl border border-white/10 p-6 mb-4 text-center">
+            <div className="flex justify-center mb-3">
+              <EmployeeAvatar name={confirmingEmployee.name} photoUrl={confirmingEmployee.photo_url} />
+            </div>
+            <h2 className="text-white text-xl font-bold">{confirmingEmployee.name}</h2>
+            {confirmingEmployee.department && (
+              <p className="text-blue-300 text-sm">{confirmingEmployee.department}</p>
+            )}
+            {lastPunch && (
+              <p className="text-white/40 text-xs mt-2">
+                Último: {lastPunch.label} {formatarDataRelativa(lastPunch.date)} às {lastPunch.time}
+              </p>
+            )}
+          </div>
+
+          {/* 4 botões de ponto */}
+          <p className="text-white/60 text-sm text-center mb-3">Selecione o que deseja registrar:</p>
+
+          <div className="grid grid-cols-2 gap-3">
+
+            <button
+              onClick={() => confirmPunch('entry_time')}
+              disabled={!!todayRecord?.entry_time}
+              className="flex flex-col items-center justify-center gap-1 py-5 rounded-xl font-bold text-white bg-green-600 hover:bg-green-700 disabled:bg-white/10 disabled:text-white/30 transition"
+            >
+              <span className="text-2xl">▶</span>
+              <span>ENTRADA</span>
+              {todayRecord?.entry_time && (
+                <span className="text-xs font-normal opacity-70">{todayRecord.entry_time.slice(0, 5)}</span>
+              )}
+            </button>
+
+            <button
+              onClick={() => confirmPunch('break_start')}
+              disabled={!todayRecord?.entry_time || !!todayRecord?.break_start}
+              className="flex flex-col items-center justify-center gap-1 py-5 rounded-xl font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:bg-white/10 disabled:text-white/30 transition"
+            >
+              <span className="text-2xl">⏸</span>
+              <span>INTERVALO</span>
+              {todayRecord?.break_start && (
+                <span className="text-xs font-normal opacity-70">{todayRecord.break_start.slice(0, 5)}</span>
+              )}
+            </button>
+
+            <button
+              onClick={() => confirmPunch('break_end')}
+              disabled={!todayRecord?.break_start || !!todayRecord?.break_end}
+              className="flex flex-col items-center justify-center gap-1 py-5 rounded-xl font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:bg-white/10 disabled:text-white/30 transition"
+            >
+              <span className="text-2xl">▶</span>
+              <span>RETORNO</span>
+              {todayRecord?.break_end && (
+                <span className="text-xs font-normal opacity-70">{todayRecord.break_end.slice(0, 5)}</span>
+              )}
+            </button>
+
+            <button
+              onClick={() => confirmPunch('exit_time')}
+              disabled={!todayRecord?.entry_time || !!todayRecord?.exit_time}
+              className="flex flex-col items-center justify-center gap-1 py-5 rounded-xl font-bold text-white bg-red-600 hover:bg-red-700 disabled:bg-white/10 disabled:text-white/30 transition"
+            >
+              <span className="text-2xl">■</span>
+              <span>SAÍDA</span>
+              {todayRecord?.exit_time && (
+                <span className="text-xs font-normal opacity-70">{todayRecord.exit_time.slice(0, 5)}</span>
+              )}
+            </button>
+
+          </div>
+
+          <button
+            onClick={cancelConfirmation}
+            className="w-full mt-4 text-white/40 text-sm hover:text-white/60 transition"
+          >
+            Não é você? Cancelar
+          </button>
+
+        </div>
+      </div>
+    )
+  }
+
   // ── Render: success screen ─────────────────────────────────
   if (kioskState === 'success' && punchResult && recognizedEmployee) {
     const isPositivePunch =
-      punchResult.punchType === 'Entrada' || punchResult.punchType === 'Fim de Intervalo'
+      punchResult.punchType === 'Entrada' || punchResult.punchType === 'Retorno do Intervalo'
 
     return (
       <div className="min-h-screen bg-gradient-to-b from-[#0d1b3e] to-[#1a2f5c] flex flex-col items-center justify-center p-6">
         {PendingBadge}
 
         <div className="w-full max-w-sm bg-white/5 backdrop-blur rounded-2xl border border-white/10 p-8 text-center">
-          {/* Check icon */}
           <div className="flex justify-center mb-4">
             <div className="w-12 h-12 rounded-full bg-green-500 flex items-center justify-center">
               <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -547,7 +669,6 @@ function KioskInner() {
 
           <p className="text-green-400 text-sm font-semibold mb-6">Ponto registrado com sucesso</p>
 
-          {/* Avatar */}
           <div className="flex justify-center mb-3">
             <EmployeeAvatar name={recognizedEmployee.name} photoUrl={recognizedEmployee.photo_url} />
           </div>
@@ -557,23 +678,20 @@ function KioskInner() {
             <p className="text-blue-300 text-sm mb-4">{recognizedEmployee.department}</p>
           )}
 
-          {/* Punch type + time */}
           <div className="bg-white/10 rounded-xl p-4 mb-4 mt-3">
             <div className="flex items-center justify-center gap-2 text-base font-bold text-white mb-1">
               <span className={isPositivePunch ? 'text-green-400' : 'text-amber-400'}>●</span>
-              {punchResult.punchType} registrada
+              {punchResult.punchType}
             </div>
             <div className="text-2xl font-mono text-white">{punchResult.time}</div>
           </div>
 
-          {/* Contexto: último ponto do dia anterior */}
           {lastPunch && (
             <p className="text-white/50 text-xs mb-3">
               Último ponto: {lastPunch.label} {formatarDataRelativa(lastPunch.date)} às {lastPunch.time}
             </p>
           )}
 
-          {/* Precisão GPS */}
           {punchResult.accuracy !== undefined && (
             <div className="flex items-center justify-center gap-1 text-white/40 text-xs">
               📍 Precisão de {punchResult.accuracy.toFixed(0)}m
@@ -586,52 +704,16 @@ function KioskInner() {
     )
   }
 
-  // ── Render: already done screen ────────────────────────────
-  if (kioskState === 'already-done' && recognizedEmployee) {
-    return (
-      <div className="min-h-screen bg-gradient-to-b from-[#0d1b3e] to-[#1a2f5c] flex flex-col items-center justify-center p-6">
-        {PendingBadge}
-
-        <div className="w-full max-w-sm bg-white/5 backdrop-blur rounded-2xl border border-white/10 p-8 text-center">
-          <div className="flex justify-center mb-4">
-            <div className="w-12 h-12 rounded-full bg-blue-500/60 flex items-center justify-center">
-              <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            </div>
-          </div>
-
-          <p className="text-blue-300 text-sm font-semibold mb-6">Ponto do dia encerrado</p>
-
-          <div className="flex justify-center mb-3">
-            <EmployeeAvatar name={recognizedEmployee.name} photoUrl={recognizedEmployee.photo_url} />
-          </div>
-
-          <h2 className="text-white text-xl font-bold mb-1">{recognizedEmployee.name}</h2>
-          {recognizedEmployee.department && (
-            <p className="text-blue-300 text-sm">{recognizedEmployee.department}</p>
-          )}
-
-          <p className="text-blue-300/60 text-xs mt-6">Voltando em 3 segundos...</p>
-        </div>
-      </div>
-    )
-  }
-
-  // ── Render: main kiosk — idle / loading / processing / error ─
+  // ── Render: main kiosk — idle / loading / error ────────────
   return (
     <div className="min-h-screen bg-gradient-to-b from-[#0d1b3e] to-[#1a2f5c] flex flex-col items-center justify-center p-6">
       {PendingBadge}
 
       <div className="flex items-center gap-2 mb-8">
-        <div className="w-8 h-8 rounded bg-[#2e5fab] flex items-center justify-center text-white font-bold text-sm">
-          S
-        </div>
+        <div className="w-8 h-8 rounded bg-[#2e5fab] flex items-center justify-center text-white font-bold text-sm">S</div>
         <h1 className="text-xl font-bold text-white tracking-wide">SIBOS PONTO ELETRÔNICO</h1>
       </div>
 
-      {/* Webcam */}
       <div className="relative w-full max-w-md aspect-[4/3] rounded-2xl overflow-hidden border-2 border-blue-400/30 shadow-2xl">
         <video
           ref={videoRef}
@@ -641,7 +723,6 @@ function KioskInner() {
           className="w-full h-full object-cover bg-black"
         />
 
-        {/* Loading */}
         {(kioskState === 'loading' || modelsLoading) && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70">
             <div className="w-10 h-10 border-4 border-blue-400 border-t-transparent rounded-full animate-spin mb-3" />
@@ -651,7 +732,6 @@ function KioskInner() {
           </div>
         )}
 
-        {/* Idle hint */}
         {kioskState === 'idle' && (
           <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent py-4 text-center pointer-events-none">
             <p className="text-white text-sm font-medium">
@@ -660,29 +740,18 @@ function KioskInner() {
           </div>
         )}
 
-        {/* Processing */}
-        {kioskState === 'processing' && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
-            <div className="w-10 h-10 border-4 border-blue-400 border-t-transparent rounded-full animate-spin" />
-          </div>
-        )}
-
-        {/* No employees */}
         {kioskState === 'no-employees' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-yellow-950/95 text-center px-6">
             <div className="text-5xl mb-3">⚠️</div>
             <h2 className="text-xl font-bold text-white mb-2">Nenhum colaborador cadastrado</h2>
             <p className="text-yellow-200 text-sm">
               Acesse{' '}
-              <a href={`/setup?company=${companyId}`} className="underline">
-                /setup
-              </a>{' '}
-              para cadastrar rostos.
+              <a href={`/setup?company=${companyId}`} className="underline">/setup</a>
+              {' '}para cadastrar rostos.
             </p>
           </div>
         )}
 
-        {/* Error */}
         {kioskState === 'error' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-950/95 text-center px-6">
             <div className="text-5xl mb-3">❌</div>
@@ -691,7 +760,6 @@ function KioskInner() {
         )}
       </div>
 
-      {/* Clock */}
       <div className="mt-8 text-center">
         <div className="text-6xl font-bold text-white tracking-tight font-mono">
           {fmtTime(currentTime)}
